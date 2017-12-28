@@ -1,5 +1,5 @@
 # hello-world
 just demo repository
 
+do something different
 
-here begains the friendship with git.
