@@ -182,6 +182,34 @@ public:
         av_frame_unref(frame);
         return jpeg_data;
     }
+    
+    std::vector<uint8_t> encode_rgb(const std::vector<uint8_t>& rgb_data, int width, int height) {
+        std::vector<uint8_t> jpeg_data;
+        
+        // 创建输入帧
+        AVFrame* rgb_frame = av_frame_alloc();
+        rgb_frame->width = width;
+        rgb_frame->height = height;
+        rgb_frame->format = AV_PIX_FMT_RGB24;
+        
+        if (av_frame_get_buffer(rgb_frame, 32) < 0) {
+            av_frame_free(&rgb_frame);
+            return jpeg_data;
+        }
+        
+        // 拷贝RGB数据
+        for (int y = 0; y < height; y++) {
+            memcpy(rgb_frame->data[0] + y * rgb_frame->linesize[0],
+                   rgb_data.data() + y * width * 3,
+                   width * 3);
+        }
+        
+        // 编码为JPEG
+        jpeg_data = encode(rgb_frame, width, height);
+        
+        av_frame_free(&rgb_frame);
+        return jpeg_data;
+    }
 };
 
 // 视频帧缓冲区
@@ -250,11 +278,40 @@ private:
     // 合成用的缓冲区
     std::vector<uint8_t> composite_buffer;
     
+    // 为每个流维护的SWS上下文
+    struct StreamContext {
+        SwsContext* sws_ctx = nullptr;
+        int last_src_width = 0;
+        int last_src_height = 0;
+        AVFrame* scaled_frame = nullptr;
+        
+        ~StreamContext() {
+            if (sws_ctx) {
+                sws_freeContext(sws_ctx);
+                sws_ctx = nullptr;
+            }
+            if (scaled_frame) {
+                av_frame_free(&scaled_frame);
+                scaled_frame = nullptr;
+            }
+        }
+    };
+    
+    std::vector<StreamContext> stream_contexts;
+    
+    // 辅助函数：将值限制在0-255范围内
+    uint8_t clamp_value(int value) {
+        if (value < 0) return 0;
+        if (value > 255) return 255;
+        return static_cast<uint8_t>(value);
+    }
+    
 public:
     QuadCompositor(int width = 1280, int height = 720) 
         : output_width(width), output_height(height),
           cell_width(width / 2), cell_height(height / 2) {
         cached_frames.resize(4);
+        stream_contexts.resize(4);
         
         // 初始化JPEG解码器
         const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
@@ -269,7 +326,7 @@ public:
         }
         
         // 初始化合成缓冲区
-        composite_buffer.resize(output_width * output_height * 3);
+        composite_buffer.resize(output_width * output_height * 3, 0);
     }
     
     ~QuadCompositor() {
@@ -284,8 +341,10 @@ public:
         cached_frames[index] = jpeg_data;
     }
     
-    // 简化的JPEG到RGB转换（实际应用中应该使用libjpeg或FFmpeg进行解码）
-    bool decode_jpeg_to_rgb(const std::vector<uint8_t>& jpeg_data, std::vector<uint8_t>& rgb_data, int& width, int& height) {
+    // JPEG到RGB转换
+    bool decode_jpeg_to_rgb(const std::vector<uint8_t>& jpeg_data, 
+                          std::vector<uint8_t>& rgb_data, 
+                          int& width, int& height) {
         if (jpeg_data.empty() || !decode_ctx || !parser_ctx) {
             return false;
         }
@@ -323,35 +382,49 @@ public:
                     }
                     
                     if (frame->format == AV_PIX_FMT_YUVJ420P) {
-                        // 简化的YUVJ420P到RGB转换
-                        width = frame->width;
-                        height = frame->height;
-                        rgb_data.resize(width * height * 3);
+                        // 创建RGB帧
+                        AVFrame* rgb_frame = av_frame_alloc();
+                        rgb_frame->width = frame->width;
+                        rgb_frame->height = frame->height;
+                        rgb_frame->format = AV_PIX_FMT_RGB24;
                         
-                        // 这里应该使用sws_scale进行正确的转换，但为了简化我们使用近似转换
-                        // 实际应用中应该使用: sws_scale(yuv_to_rgb_ctx, ...)
-                        for (int y = 0; y < height; y++) {
-                            for (int x = 0; x < width; x++) {
-                                int Y = frame->data[0][y * frame->linesize[0] + x];
-                                int U = frame->data[1][(y/2) * frame->linesize[1] + (x/2)];
-                                int V = frame->data[2][(y/2) * frame->linesize[2] + (x/2)];
+                        if (av_frame_get_buffer(rgb_frame, 32) >= 0) {
+                            // 创建SWS上下文进行YUV到RGB转换
+                            SwsContext* sws_ctx = sws_getContext(
+                                frame->width, frame->height,
+                                AV_PIX_FMT_YUVJ420P,
+                                frame->width, frame->height,
+                                AV_PIX_FMT_RGB24,
+                                SWS_BILINEAR, nullptr, nullptr, nullptr
+                            );
+                            
+                            if (sws_ctx) {
+                                sws_scale(sws_ctx, frame->data, frame->linesize,
+                                          0, frame->height,
+                                          rgb_frame->data, rgb_frame->linesize);
                                 
-                                // YUV to RGB conversion (简化版)
-                                int R = Y + 1.402 * (V - 128);
-                                int G = Y - 0.344 * (U - 128) - 0.714 * (V - 128);
-                                int B = Y + 1.772 * (U - 128);
+                                sws_freeContext(sws_ctx);
                                 
-                                int idx = (y * width + x) * 3;
-                                rgb_data[idx] = std::clamp(R, 0, 255);
-                                rgb_data[idx + 1] = std::clamp(G, 0, 255);
-                                rgb_data[idx + 2] = std::clamp(B, 0, 255);
+                                // 将RGB数据复制到输出缓冲区
+                                width = frame->width;
+                                height = frame->height;
+                                rgb_data.resize(width * height * 3);
+                                
+                                for (int y = 0; y < height; y++) {
+                                    memcpy(rgb_data.data() + y * width * 3,
+                                           rgb_frame->data[0] + y * rgb_frame->linesize[0],
+                                           width * 3);
+                                }
+                                
+                                success = true;
                             }
+                            
+                            av_frame_free(&rgb_frame);
                         }
-                        
-                        success = true;
                     }
                     
                     av_frame_unref(frame);
+                    break; // 只处理一帧
                 }
             }
         }
@@ -392,24 +465,94 @@ public:
                     int start_x = (i % 2) * cell_width;
                     int start_y = (i / 2) * cell_height;
                     
-                    // 缩放并复制到合成缓冲区
-                    for (int y = 0; y < cell_height; y++) {
-                        for (int x = 0; x < cell_width; x++) {
-                            // 计算源图像中的位置（进行缩放）
-                            int src_x = (x * frame_width) / cell_width;
-                            int src_y = (y * frame_height) / cell_height;
-                            
-                            if (src_x < frame_width && src_y < frame_height) {
-                                int src_idx = (src_y * frame_width + src_x) * 3;
-                                int dst_idx = ((start_y + y) * output_width + (start_x + x)) * 3;
+                    // 创建或更新SWS上下文
+                    StreamContext& ctx = stream_contexts[i];
+                    bool need_new_sws = false;
+                    
+                    if (!ctx.sws_ctx) {
+                        need_new_sws = true;
+                    } else if (ctx.last_src_width != frame_width || 
+                               ctx.last_src_height != frame_height) {
+                        need_new_sws = true;
+                    }
+                    
+                    if (need_new_sws) {
+                        if (ctx.sws_ctx) {
+                            sws_freeContext(ctx.sws_ctx);
+                            ctx.sws_ctx = nullptr;
+                        }
+                        
+                        // 使用双三次插值进行高质量缩放
+                        ctx.sws_ctx = sws_getContext(
+                            frame_width, frame_height,
+                            AV_PIX_FMT_RGB24,
+                            cell_width, cell_height,
+                            AV_PIX_FMT_RGB24,
+                            SWS_BICUBIC, nullptr, nullptr, nullptr  // 改为双三次插值
+                        );
+                        
+                        if (!ctx.sws_ctx) {
+                            std::cerr << "Failed to create sws context for stream " << i << std::endl;
+                            continue;
+                        }
+                        
+                        ctx.last_src_width = frame_width;
+                        ctx.last_src_height = frame_height;
+                        
+                        // 创建缩放后的帧
+                        if (ctx.scaled_frame) {
+                            av_frame_free(&ctx.scaled_frame);
+                        }
+                        ctx.scaled_frame = av_frame_alloc();
+                        ctx.scaled_frame->width = cell_width;
+                        ctx.scaled_frame->height = cell_height;
+                        ctx.scaled_frame->format = AV_PIX_FMT_RGB24;
+                        
+                        if (av_frame_get_buffer(ctx.scaled_frame, 32) < 0) {
+                            std::cerr << "Failed to allocate scaled frame buffer for stream " << i << std::endl;
+                            continue;
+                        }
+                    }
+                    
+                    // 准备源数据
+                    AVFrame* src_frame = av_frame_alloc();
+                    src_frame->width = frame_width;
+                    src_frame->height = frame_height;
+                    src_frame->format = AV_PIX_FMT_RGB24;
+                    
+                    if (av_frame_get_buffer(src_frame, 32) >= 0) {
+                        // 拷贝RGB数据到源帧
+                        for (int y = 0; y < frame_height; y++) {
+                            memcpy(src_frame->data[0] + y * src_frame->linesize[0],
+                                   rgb_data.data() + y * frame_width * 3,
+                                   frame_width * 3);
+                        }
+                        
+                        // 使用SWS进行高质量缩放
+                        sws_scale(ctx.sws_ctx, src_frame->data, src_frame->linesize,
+                                  0, frame_height,
+                                  ctx.scaled_frame->data, ctx.scaled_frame->linesize);
+                        
+                        av_frame_free(&src_frame);
+                        
+                        // 将缩放后的图像复制到合成缓冲区
+                        for (int y = 0; y < cell_height; y++) {
+                            if (start_y + y < output_height) {
+                                int dst_offset = ((start_y + y) * output_width + start_x) * 3;
+                                int src_offset = y * ctx.scaled_frame->linesize[0];
                                 
-                                if (src_idx + 2 < rgb_data.size() && dst_idx + 2 < composite_buffer.size()) {
-                                    composite_buffer[dst_idx] = rgb_data[src_idx];
-                                    composite_buffer[dst_idx + 1] = rgb_data[src_idx + 1];
-                                    composite_buffer[dst_idx + 2] = rgb_data[src_idx + 2];
+                                int copy_width = std::min(cell_width, output_width - start_x);
+                                
+                                if (dst_offset + copy_width * 3 <= composite_buffer.size() &&
+                                    src_offset + copy_width * 3 <= cell_width * cell_height * 3) {
+                                    memcpy(composite_buffer.data() + dst_offset,
+                                           ctx.scaled_frame->data[0] + src_offset,
+                                           copy_width * 3);
                                 }
                             }
                         }
+                    } else {
+                        av_frame_free(&src_frame);
                     }
                 }
             }
@@ -1563,6 +1706,7 @@ int main(int argc, char* argv[]) {
     std::cout << "  √ 统一控制：全部启动/全部停止" << std::endl;
     std::cout << "  √ 实时合成，网格布局" << std::endl;
     std::cout << "  √ 支持1280x720输入流，合成1280x720输出" << std::endl;
+    std::cout << "  √ 使用SWS双三次插值进行高质量缩放" << std::endl;
     std::cout << std::endl;
     std::cout << "HTTP接口:" << std::endl;
     std::cout << "  GET  /              - 四画面Web界面" << std::endl;
